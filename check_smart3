@@ -1,0 +1,254 @@
+#!/usr/bin/perl -w
+# Check disks SMART status and temperature for Nagios
+# That two times not to rise, deduces temperature in a collectd format
+# Designed by Phil Kulin for http://diphost.ru/ at year 2012
+#
+#            DO WHAT THE FUCK YOU WANT TO PUBLIC LICENSE
+#                    Version 2, December 2004
+#
+# Copyright (C) 2004 Sam Hocevar
+#  14 rue de Plaisance, 75014 Paris, France
+# Everyone is permitted to copy and distribute verbatim or modified
+# copies of this license document, and changing it is allowed as long
+# as the name is changed.
+#
+#            DO WHAT THE FUCK YOU WANT TO PUBLIC LICENSE
+#   TERMS AND CONDITIONS FOR COPYING, DISTRIBUTION AND MODIFICATION
+#
+# 0. You just DO WHAT THE FUCK YOU WANT TO.
+
+use strict;
+
+# you may want to change this for security reason
+$ENV{'PATH'}='/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin:/usr/local/sbin';
+my $smart_command = 'smartd';
+
+=head1 DESCRIPTION
+
+check_smart3 parse smartd daemon (from smartmontools) output and create report for nagios.
+That two times not to rise, deduces temperature in a collectd format too.
+
+The majority of similar tools parse monstrous smartctl output. Also smartctl
+demands separate exec on each disk. So smartd output more clean and simple.
+One of ideas of the check_smart3 consists that we don't need separate nagios alerts on
+problems of each disk. I consider all disks as one destruction point. But certainly
+check_smart3 can be used and for checks each disk separately.
+
+=head1 EXAMPLES
+
+Nagios check:
+check_smart3 -n -w 50 -c 55
+
+Collecting temperature with collectd:
+check_smart3 -l 600,, | nc -U /var/run/collectd-unixsock
+
+crontab line for collecting temperature with collectd:
+*/5 * * * * /usr/bin/lockf -s -t 0 /var/run/check_smart3.lock /usr/local/sbin/check_smart3 -l 600,, | /usr/bin/nc -U /var/run/collectd-unixsock > /dev/null
+
+=cut
+
+# print help message
+sub print_help() {
+	my $progname=$0;
+	print <<END;
+Usage: $progname [-d] [[-l [<interval>],[<host>],[<instance>]]|[-n [-w <temp>] [-c <temp>]]] [<device> ...]|[-a]|[-f]
+  -h: this help
+  -d: show debugging information
+  -n: nagios output format, not use with collectd output
+  -w <warning temperature>: only for nagios, temperature warning limit
+  -c <critical temperature>: only for nagios, temperature critical limit
+  -l: collectd output format, not use with nagios output
+  [<interval>],[<host>],[<instance>]: path for collectd data, may be ',,' or '600,myhostname,hddtemp'
+  <device>: a device to be SMART monitored, eg /dev/sda
+  -a: autoscan for devices (default)
+  -f: apply default smartd config from file in default place
+END
+};
+
+# escalate status for nagios
+my $exit_status = 'OK';
+sub escalate_status($) {
+	my $requested_status = shift;
+	# no test for 'CRITICAL'; automatically escalates upwards
+	if ($requested_status eq 'WARNING') {
+		return if $exit_status eq 'CRITICAL';
+	}
+	if ($requested_status eq 'UNKNOWN') {
+		return if $exit_status eq 'WARNING';
+		return if $exit_status eq 'CRITICAL';
+	}
+	$exit_status = $requested_status;
+}
+
+# devises vector
+my @devices = qw//;
+# temperature limits
+my ($temp_warn,$temp_crit) = (0,0);
+# config modes: 0 - auto scan devices, 1 - standart config file, 2 - devices from commandline
+# report modes: 0 - do nothing, 1 - nagios format, 2 - collectd data output
+my ($debug, $configmode, $reportmode) = (0,0,0);
+# collectd internals
+my ($c_int,$c_host,$c_inst,$c_type,$c_time,$collectd_message) = qw//;
+# nagios mode status
+my $message_string = '';
+
+# get options. its simple
+while (my $arg = shift @ARGV) {
+	if ($arg eq '-h') {
+		print_help();
+		exit 0;
+	} elsif ($arg eq '-n') {
+		$reportmode=1;
+	} elsif ($arg eq '-w') {
+		$temp_warn=shift @ARGV;
+		unless ($temp_warn =~ /\d+/) {
+			print STDERR "Must specify an numerical temperature warning limit! \n\n";
+			print_help();
+			exit 1;
+		};
+	} elsif ($arg eq '-c') {
+		$temp_crit=shift @ARGV;
+		unless ($temp_crit =~ /\d+/) {
+			print STDERR "Must specify an numerical temperature critical limit! \n\n";
+			print_help();
+			exit 1;
+		};
+	} elsif ($arg eq '-l') {
+		$reportmode=2;
+		my $collectd=shift @ARGV;
+		unless ($collectd =~ /^.*\,.*\,.*$/g) {
+			print STDERR "Must specify an parameters <[interval],[host],[instance]> with -c !\n\n";
+			print_help();
+			exit 1;
+		};
+		($c_int,$c_host,$c_inst)=split(',',$collectd);
+	} elsif ($arg eq '-d') {
+		$debug=1;
+	} elsif ($arg eq '-f') {
+		$configmode=1;
+		(@devices)=qw//;
+	} elsif ($arg eq '-a') {
+		$configmode=0;
+		(@devices)=qw//;
+	} else {
+		$configmode=2;
+		push @devices, $arg;
+	};
+};
+
+# build collectd parameters
+$c_host ||= $ENV{'HOST'};
+$c_host ||= $ENV{'HOSTNAME'};
+$c_inst ||= 'hddtemp';
+$c_time=time();
+$c_int ||= 10;
+
+# print debug summary
+if ($debug) {
+	print STDERR  "*** Auto scan devices\n" unless $configmode;
+	print STDERR  "*** Devices and tests from smartd config file\n" if $configmode==1;
+	print STDERR  "*** Devices from commandline\n" if $configmode==2;
+	print STDERR  "*** Nagios output selected\n"  if $reportmode==1;
+	print STDERR  "*** Collectd instance '$c_int/$c_host/$c_inst' at $c_time\n" if $reportmode==2;
+	print STDERR  "*** Not output format selected\n" if $reportmode==0;
+} elsif ($reportmode==0) {
+	print_help();
+	exit(0);
+};
+
+# command string build
+my $full_command = '';
+if ($configmode != 1) {
+	my $configstring = '';
+	if ($configmode==2) {
+		while (@devices) {
+			my $device = shift @devices;
+			$configstring .= "$device -a -W 0,100,100\n";
+		};
+	} elsif ($configmode==0) {
+		$configstring = 'DEVICESCAN -a -W 0,100,100';
+	};
+	$full_command = "echo \"$configstring\" | $smart_command -c - -q onecheck";
+} else {
+	$full_command = "$smart_command -q onecheck";
+};
+print STDERR  "*** executing: $full_command\n" if $debug;
+
+# exec smartd
+my $lastdevice='';
+my @msg = qw//;
+open SMARTCOM, "$full_command |" || die "Something wrong: $!";
+while (my $line = <SMARTCOM>) {
+	# parse smartd output
+	print STDERR  "*** [smartd] $line" if $debug;
+	if ( $line =~ /^Device\:\s+(.*?)\,\s*(.*)/) {
+		my $device=$1;
+		my $status_string=$2;
+		if ($lastdevice ne $device) {
+			if ($lastdevice) {
+				$message_string .= join(',',@msg) . ';';
+				@msg = qw//;
+			};
+			$message_string .= " $device: ";
+			$lastdevice = $device;
+		};
+		if ($status_string =~ /^initial\sTemperature\sis\s(\d*)/ ) {
+			my $current_temp = $1;
+			push(@msg, "T=$current_temp");
+			if ($temp_warn and ($current_temp > $temp_warn)) {
+				push(@msg, "temp warning");
+				escalate_status('WARNING');
+			};
+			if ($temp_crit and ($current_temp >= $temp_crit)) {
+				push(@msg, "temp critical");
+				escalate_status('CRITICAL');
+			};
+			my $c_type='temperature-'.(split('/',$device))[-1];
+			$collectd_message .= "PUTVAL $c_host/$c_inst/$c_type interval=$c_int $c_time:$current_temp\n";
+		} elsif ($status_string =~ /^FAILED\sSMART/ or $status_string =~ /^SMART\sFailure/) {
+			push(@msg, "FAILED SMART");
+			escalate_status('CRITICAL');
+		} elsif ($status_string =~ /^Failed\sSMART\susage\sAttribute\:\s(\d*)/) {
+			push(@msg,"Failed attribute $1");
+			escalate_status('CRITICAL');
+		} elsif ($status_string =~ /^(\d+)\s+(.*)/) {
+			push(@msg, "$2 ($1)");
+			escalate_status('WARNING');
+		};
+	} elsif ( $line =~ /^Monitoring\s+/) {
+		# Dirty hack for skip initial input
+		$lastdevice = '';
+		$message_string = '';
+		@msg = qw//;
+	};
+};
+close SMARTCOM;
+
+if (scalar @msg) {
+	$message_string .= join(',',@msg);
+};
+
+my $return_code = $? >> 8;
+if ($return_code != 0) {
+	$message_string .= "some failure with smartd execution (exit code $return_code)";
+	escalate_status('UNKNOWN');
+	print STDERR  "*** smartd exit code: $return_code\n" if $debug;
+};
+
+# output report
+if ($reportmode==2) {
+	if($collectd_message) {
+		# collectd report
+		print "$collectd_message";
+	} else {
+		print STDERR  "*** Not collected info\n" if $debug;
+	};
+} elsif ($reportmode==1) {
+	# nagios report
+	print "SMART $exit_status - $message_string\n";
+	exit(1) if $exit_status eq 'WARNING';
+	exit(2) if $exit_status eq 'CRITICAL';
+	exit(3) if $exit_status eq 'UNKNOWN';
+};
+
+exit(0);
