@@ -21,15 +21,21 @@ EXAMPLES
 --------
  
 Nagios check: 
-check_smart3 -n -w 50 -c 55 
+> check_smart3 -n -w 50 -c 55 
  
 Collecting temperature with collectd: 
-check_smart3 -l 600,, | nc -U /var/run/collectd-unixsock 
+> check_smart3 -l 600,, | nc -U /var/run/collectd-unixsock 
  
 crontab line for collecting temperature with collectd: 
-*/5 * * * * /usr/bin/lockf -s -t 0 /var/run/check_smart3.lock /usr/local/sbin/check_smart3 -l 600,, | /usr/bin/nc -U /var/run/collectd-unixsock > /dev/null 
+> */5 * * * * /usr/bin/lockf -s -t 0 /var/run/check_smart3.lock /usr/local/sbin/check_smart3 -l 600,, | /usr/bin/nc -U /var/run/collectd-unixsock > /dev/null 
  
-BABLO
------
+DONATE
+------
 
-For coffee and nuts Yandex.Money 41001140237324
+For coffee and nuts
+* Yandex.Money: 41001140237324
+* PayPal: schors@gmail.com
+
+--
+[![LICENSE WTFPL](wtfpl-badge-1.png)](LICENSE)
+
